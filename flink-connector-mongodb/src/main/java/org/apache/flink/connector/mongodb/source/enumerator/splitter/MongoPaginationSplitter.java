@@ -65,7 +65,7 @@ public class MongoPaginationSplitter {
         BsonDocument filter = readOptions.getFilter();
 
         // Determine best supporting index if filter provided, otherwise _id
-        // Only equality fields qualify without being wrapped inside $and, etc
+        // Only equality fields qualify
         BsonDocument indexHint = findBestSupportingIndex(splitContext.getMongoCollection(), filter);
 
         // If filter present, only include indexed fields for query to build the splits
