@@ -26,7 +26,6 @@ import com.mongodb.MongoNamespace;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.model.Projections;
-import com.mongodb.client.model.Sorts;
 import org.bson.BsonDocument;
 import org.bson.BsonValue;
 import org.bson.Document;
@@ -55,9 +54,6 @@ import static org.apache.flink.connector.mongodb.common.utils.MongoConstants.ID_
 public class MongoPaginationSplitter {
 
     private static final Logger LOG = LoggerFactory.getLogger(MongoPaginationSplitter.class);
-
-    // The number of _id to return per fetch; although MongoDB will limit the batch size to 16MB
-    private static final int ID_BATCH_SIZE = 100_000;
 
     public static Collection<MongoScanSourceSplit> split(MongoSplitContext splitContext) {
         MongoReadOptions readOptions = splitContext.getReadOptions();
@@ -154,32 +150,36 @@ public class MongoPaginationSplitter {
             int partitionRecordSize) {
 
         List<BsonValue> boundaries = new ArrayList<>();
+        BsonDocument maxBound = createIndexBound(indexHint, filter, BSON_MAX_KEY, BSON_MAX_KEY);
+        BsonValue lastBoundary = BSON_MIN_KEY;
 
-        BsonDocument cursorFilter = filter == null ? new BsonDocument() : filter;
+        // Per-boundary index walk: each query positions at the previous boundary using min/max
+        // hints, then skips `partitionRecordSize` index entries and returns one _id as the next
+        // boundary. On the first iteration `min` starts at the beginning of the index range; on
+        // subsequent iterations it re-enters the index exactly at the previous boundary so each
+        // skip covers exactly one split's worth of entries. Note: worth noting that _id: -1
+        // index order is not supported.
+        while (true) {
+            BsonDocument minBound = createIndexBound(indexHint, filter, lastBoundary, BSON_MIN_KEY);
 
-        // Single index sort and scan avoids repeated sort/skip/limit queries (slow); batch size
-        // controls the number of documents per getMore round-trip.
-        try (MongoCursor<BsonDocument> cursor =
-                collection
-                        .find(cursorFilter)
-                        .projection(Projections.include(ID_FIELD))
-                        .sort(Sorts.ascending(ID_FIELD))
-                        .hint(indexHint)
-                        .batchSize(ID_BATCH_SIZE)
-                        .noCursorTimeout(true)
-                        .iterator()) {
+            try (MongoCursor<BsonDocument> cursor =
+                    collection
+                            .find()
+                            .projection(Projections.include(ID_FIELD))
+                            .hint(indexHint)
+                            .min(minBound)
+                            .max(maxBound)
+                            .skip(partitionRecordSize)
+                            .limit(1)
+                            .iterator()) {
 
-            long seen = 0L;
-
-            while (cursor.hasNext()) {
-                BsonDocument doc = cursor.next();
-
-                // The first document of the next partition becomes the upper bound
-                if (seen > 0 && seen % partitionRecordSize == 0) {
-                    boundaries.add(doc.get(ID_FIELD));
+                if (!cursor.hasNext()) {
+                    break;
                 }
 
-                seen++;
+                BsonValue boundary = cursor.next().get(ID_FIELD);
+                boundaries.add(boundary);
+                lastBoundary = boundary;
             }
         }
 
